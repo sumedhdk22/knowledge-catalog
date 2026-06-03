@@ -50,6 +50,7 @@ assert:
   fileSystem:
     catalog/kb-entry.yaml:
       - contains: "name: kb-entry"
+    catalog/kb-entry.overview.md:
       - contains: "New custom description"
   catalog:
     entries:

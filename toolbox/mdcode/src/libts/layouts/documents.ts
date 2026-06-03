@@ -8,25 +8,29 @@ import * as yaml from 'yaml';
 import * as md from '../metadata';
 import { CatalogLayout } from '../layout';
 import { CatalogSource } from '../source';
+import { CatalogManifest } from '../manifest';
 
 const OVERVIEW_ASPECT_KEY = 'dataplex-types.global.overview';
 
 export class DocumentsLayout implements CatalogLayout {
 
-  private _catalogPath: string = '';
-  private _source: CatalogSource;
+  private readonly _catalogPath: string;
+  private readonly _source: CatalogSource;
+  private readonly _manifest: CatalogManifest;
 
   private readonly _index = new Map<string, string>();
 
-  constructor(catalogPath: string, source: CatalogSource) {
+  constructor(catalogPath: string, source: CatalogSource, manifest: CatalogManifest) {
     this._catalogPath = catalogPath;
     this._source = source;
+    this._manifest = manifest;
   }
 
   async init(): Promise<void> {
     this._index.clear();
     // Temporary reference to satisfy TS compiler
     this._source;
+    this._manifest;
 
     if (!fs.existsSync(this._catalogPath)) {
       return;
