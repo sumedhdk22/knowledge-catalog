@@ -4,6 +4,7 @@
 import * as gcp from './gcp';
 import { CatalogSnapshot, toLocalEntry } from './snapshot';
 import { CatalogState } from './state';
+import * as md from './metadata';
 import { calculateEntryChecksum, calculateAspectChecksum } from './checksum';
 
 export interface SyncResult {
@@ -182,48 +183,149 @@ export class CatalogSync {
     }
   }
 
-  // Pushes local metadata to the Catalog service to publish/deploy it.
-  async push(options?: { force?: boolean, validateOnly?: boolean; }): Promise<SyncResult> {
-    const entries = await this._snapshot.listEntries();
+  async push(options: { force?: boolean, allowPartial?: boolean, dryRun?: boolean, validateOnly?: boolean; } = {}): Promise<SyncResult> {
+    const statusRes = await this.status();
+    const changesToPush = statusRes.changes.filter(c => c.status !== 'Unchanged');
 
-    for (const name of entries) {
-      const entry = await this._snapshot._fetchEntry(name);
-      if (!entry) {
-        // If this was filtered out based on publishing config
-        continue;
+    if (changesToPush.length === 0) {
+      return { success: true };
+    }
+
+    const state = new CatalogState(this._snapshot.basePath);
+    try {
+      if (!options.dryRun) {
+          await state.lock();
       }
+      state.load();
 
-      // TODO: Track what has changed and do minimal update.
-      // TODO: Handle creates and deletes, as well as partial updates.
-      // TODO: Handle conflicts.
+      for (const change of changesToPush) {
+        const localName = change.name;
+        
+        if (change.status === 'Deleted') {
+           if (options.dryRun) console.log(`[Dry Run] Would delete entry ${localName}`);
+           // Delete not implemented for Catalog service yet, skipping
+           continue;
+        }
 
-      const nameParts = entry.name.split('/');
-      const project = nameParts[1];
-      const location = nameParts[3];
+        const entry = await this._snapshot._fetchEntry(localName);
+        if (!entry) continue;
+        
+        const mdEntry = toLocalEntry(entry, localName);
 
-      const updateMask = [];
-      const aspectKeys = Object.keys(entry.aspects || {});
-      if (aspectKeys.length) {
-        updateMask.push('aspects');
-      }
+        const stateEntry = state.getEntry(localName);
+        const nameParts = entry.name.split('/');
+        const project = nameParts[1];
+        const location = nameParts[3];
 
-      if (!this._snapshot.manifest.source.ingestedEntries) {
-        if (entry.entrySource) {
-          updateMask.push('entry_source');
+        let remoteEntry: md.Entry | null = null;
+        if (stateEntry) {
+            const res = await this._catalog.lookupEntry(project, location, entry.name, [...this._snapshot.aspectTypes.keys()]);
+            if (res.status === 200 && res.result) {
+               remoteEntry = toLocalEntry(res.result, localName);
+            }
+        }
+
+        const aspectsToPush: string[] = [];
+        const localAspectChecksums: Record<string, string> = {};
+        const newBaseAspectChecksums: Record<string, string> = { ...stateEntry?.aspects };
+        let conflictDetected = false;
+
+        if (mdEntry.aspects) {
+           for (const [aspectKey, aspectData] of Object.entries(mdEntry.aspects)) {
+              const localChecksum = calculateAspectChecksum(aspectData);
+              localAspectChecksums[aspectKey] = localChecksum;
+              
+              if (!stateEntry || stateEntry.aspects?.[aspectKey] !== localChecksum) {
+                 // Locally modified aspect
+                 let aspectConflict = false;
+                 
+                 if (remoteEntry && stateEntry && stateEntry.aspects?.[aspectKey]) {
+                     const remoteAspectData = remoteEntry.aspects?.[aspectKey];
+                     const remoteAspectChecksum = remoteAspectData ? calculateAspectChecksum(remoteAspectData) : undefined;
+                     if (remoteAspectChecksum !== stateEntry.aspects[aspectKey]) {
+                         aspectConflict = true;
+                         conflictDetected = true;
+                     }
+                 }
+                 
+                 if (aspectConflict) {
+                     if (options.dryRun && !options.force && !options.allowPartial) {
+                         console.log(`[Dry Run] Conflict: ${localName} aspect ${aspectKey} was modified remotely (would abort push)`);
+                         continue;
+                     }
+                     if (!options.force && !options.allowPartial) {
+                         return { success: false, details: `Cannot push: conflict on ${localName} aspect ${aspectKey}. Use --force to overwrite or --allow-partial to skip.` };
+                     }
+                     if (!options.force && options.allowPartial) {
+                         if (options.dryRun) {
+                             console.log(`[Dry Run] Partial Push: skipping conflicting aspect ${aspectKey} on ${localName}`);
+                         } else {
+                             const remoteAspectData = remoteEntry!.aspects?.[aspectKey];
+                             if (remoteAspectData) {
+                                 newBaseAspectChecksums[aspectKey] = calculateAspectChecksum(remoteAspectData);
+                             } else {
+                                 delete newBaseAspectChecksums[aspectKey];
+                             }
+                         }
+                         continue;
+                     }
+                 }
+                 
+                 aspectsToPush.push(aspectKey);
+              }
+           }
+        }
+
+        if (aspectsToPush.length > 0 || change.status === 'Created' || change.status === 'Modified') {
+           if (options.dryRun) {
+               console.log(`[Dry Run] Would push ${localName} with aspects: ${aspectsToPush.join(', ')}`);
+           } else {
+               const updateMask = [];
+               if (aspectsToPush.length > 0) updateMask.push('aspects');
+               if (!this._snapshot.manifest.source.ingestedEntries && entry.entrySource) updateMask.push('entry_source');
+               
+               const tempAspects = entry.aspects;
+               const filteredAspects: Record<string, any> = {};
+               for (const k of aspectsToPush) {
+                  if (tempAspects) filteredAspects[k] = tempAspects[k];
+               }
+               entry.aspects = filteredAspects;
+               
+               const res = await this._catalog.modifyEntry(project, location, entry, updateMask, aspectsToPush);
+               entry.aspects = tempAspects;
+               
+               if (res.status !== 200 || !res.result) {
+                 return { success: false, details: `Failed to update entry ${localName}: ${res.message || res.status}` };
+               }
+               
+               for (const k of aspectsToPush) {
+                   newBaseAspectChecksums[k] = localAspectChecksums[k];
+               }
+           }
+        }
+        
+        if (!options.dryRun) {
+            state.updateEntry(localName, {
+               entryChecksum: calculateEntryChecksum(mdEntry),
+               lastSyncTime: new Date().toISOString(),
+               aspects: newBaseAspectChecksums
+            });
         }
       }
 
-      if (!updateMask.length) {
-        continue;
+      if (!options.dryRun) {
+          state.save();
       }
-
-      const res = await this._catalog.modifyEntry(project, location, entry, updateMask, aspectKeys);
-      if (res.status !== 200 || !res.result) {
-        return { success: false, details: `Failed to update entry ${name}: ${res.message || res.status}` };
+      return { success: true };
+    }
+    catch (e: any) {
+      return { success: false, details: e.message };
+    }
+    finally {
+      if (!options.dryRun) {
+          await state.unlock();
       }
     }
-
-    return { success: true };
   }
 
   async validate(): Promise<ValidationResult> {
